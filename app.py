@@ -28,7 +28,7 @@ CATALOG = {
     "GBP/USD": ("United Kingdom", "FX", "DEXUSUK", "fx"),
 }
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
 def fetch_fred(code):
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
     r = requests.get(url, params={"id": code}, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
