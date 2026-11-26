@@ -1,322 +1,108 @@
+        cols = list(raw.columns)
+        with st.sidebar:
+            date_col = st.selectbox("Date column", cols, index=0)
+            value_col = st.selectbox("Value column", cols, index=min(1, len(cols)-1))
+        if sg_name.strip() and sg_name not in series:
+            series[sg_name] = normalise_uploaded(raw, date_col, value_col, sg_name)
+            meta[sg_name] = {"country": "Singapore", "category": "Rates", "kind": "rate", "source": "User-uploaded public CSV"}
+    except Exception as exc:
+        st.sidebar.error(f"Could not read CSV: {exc}")
 
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import requests
-from io import StringIO
+# Derived rates: percentage-point difference between two yield levels.
+if "US 10Y Treasury" in series and "US 2Y Treasury" in series:
+    series["US 10Y–2Y curve"] = (series["US 10Y Treasury"] - series["US 2Y Treasury"]).dropna()
+    meta["US 10Y–2Y curve"] = {"country": "United States", "category": "Rates", "kind": "rate", "source": "Calculated from FRED"}
+if "US HY OAS" in series and "US IG OAS" in series:
+    series["US HY–IG OAS gap"] = (series["US HY OAS"] - series["US IG OAS"]).dropna()
+    meta["US HY–IG OAS gap"] = {"country": "United States", "category": "Credit", "kind": "rate", "source": "Calculated from FRED"}
 
-st.set_page_config(
-    page_title="Macrofinancial Risk Monitor",
-    page_icon="📈",
-    layout="wide"
-)
+if failures:
+    with st.expander(f"Data retrieval warnings ({len(failures)})"):
+        for name, message in failures.items():
+            st.write(f"{name}: {message}")
 
-SERIES = {
-    "US 2Y Yield": ("DGS2", "bp"),
-    "US 5Y Yield": ("DGS5", "bp"),
-    "US 10Y Yield": ("DGS10", "bp"),
-    "US 30Y Yield": ("DGS30", "bp"),
-    "US IG OAS": ("BAMLC0A0CM", "bp"),
-    "US HY OAS": ("BAMLH0A0HYM2", "bp"),
-    "US BBB OAS": ("BAMLC0A4CBBB", "bp"),
-    "VIX": ("VIXCLS", "points"),
-    "S&P 500": ("SP500", "%"),
-    "USD/SGD": ("DEXSIUS", "%"),
-}
-
-@st.cache_data(ttl=3600)
-def load_data():
-    series_list = []
-
-    for name, (code, unit) in SERIES.items():
-        try:
-            url = (
-                "https://fred.stlouisfed.org/"
-                f"graph/fredgraph.csv?id={code}"
-            )
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-
-            df = pd.read_csv(StringIO(response.text))
-            dates = pd.to_datetime(df.iloc[:, 0])
-            values = pd.to_numeric(
-                df.iloc[:, 1], errors="coerce"
-            )
-
-            s = pd.Series(
-                values.to_numpy(),
-                index=pd.DatetimeIndex(dates),
-                name=name
-            )
-            series_list.append(s)
-
-        except Exception as e:
-            st.warning(f"Could not load {name}: {e}")
-
-    if not series_list:
-        return pd.DataFrame()
-
-    return pd.concat(series_list, axis=1).sort_index()
-
-
-st.title("Macrofinancial Risk Monitor")
-st.caption("Public market data | Source: FRED")
-
-with st.spinner("Retrieving market data..."):
-    data = load_data()
-
-if data.empty:
-    st.error("No data available. Check FRED connectivity.")
+names = [n for n, m in meta.items() if m["country"] in selected_countries and m["category"] in selected_categories]
+if not names:
+    st.info("No series match your filters. Select another economy or category, or upload Singapore rate data.")
     st.stop()
 
-tab1, tab2, tab3 = st.tabs([
-    "Market Overview",
-    "Historical Charts",
-    "Stress Benchmarking"
-])
-
-periods = {
-    "1D": 1,
-    "1W": 7,
-    "1M": 30,
-    "3M": 90,
-    "1Y": 365
-}
-
-def historical_change(s, days, unit):
-    s = s.dropna().sort_index()
+periods = {"1D": 1, "1W": 7, "1M": 30, "3M": 90, "1Y": 365}
+rows = []
+for name in names:
+    s = series[name].dropna()
     if s.empty:
-        return None
+        continue
+    m = meta[name]
+    row = {"Economy": m["country"], "Category": m["category"], "Indicator": name, "Latest": round(float(s.iloc[-1]), 4), "As of": s.index[-1].date().isoformat(), "Unit of change": "bp" if m["kind"] == "rate" else "%", "Source": m["source"]}
+    for p, d in periods.items():
+        row[p] = asof_change(s, d, m["kind"])
+    rows.append(row)
+summary = pd.DataFrame(rows)
 
-    latest_date = s.index[-1]
-    target_date = latest_date - pd.Timedelta(days=days)
+market_tab, chart_tab, stress_tab, data_tab = st.tabs(["Market Overview", "Historical Charts", "Stress Benchmarking", "Data & Sources"])
+with market_tab:
+    st.subheader("Latest market movements")
+    st.caption("Rate and spread changes in basis points; FX and index changes in percent. Latest levels are in their original source units (rates and OAS in %, VIX in points). Each series uses its own latest observation date.")
+    display = summary.drop(columns=["Source"]).copy()
+    st.dataframe(display, hide_index=True, use_container_width=True)
+    st.download_button("Download market movements CSV", summary.to_csv(index=False), file_name="macro_market_movements.csv", mime="text/csv")
+    st.info("Singapore SGS and SORA are not auto-populated in this version. Upload an official public CSV using the sidebar to add them; the FRED USD/SGD series is already available.")
 
-    previous = s.loc[s.index <= target_date]
-    if previous.empty:
-        return None
+with chart_tab:
+    st.subheader("Historical series")
+    selected = st.multiselect("Indicators", names, default=names[:1], key="chart_names")
+    window = st.selectbox("Chart period", ["3M", "1Y", "5Y", "10Y", "All"], index=2)
+    rebase = st.checkbox("Rebase to 100 (compare relative changes; suitable for positive-valued levels)", value=False)
+    if selected:
+        frames = []
+        for n in selected:
+            s = series[n].dropna()
+            if window != "All":
+                days = {"3M": 90, "1Y": 365, "5Y": 1825, "10Y": 3650}[window]
+                s = s.loc[s.index >= s.index.max() - pd.Timedelta(days=days)]
+            if rebase:
+                if s.empty or s.iloc[0] <= 0 or (s <= 0).any():
+                    st.warning(f"Cannot rebase {n}: series includes non-positive values.")
+                    continue
+                s = s / s.iloc[0] * 100
+            frames.append(pd.DataFrame({"Date": s.index, "Value": s.to_numpy(), "Indicator": n}))
+        if frames:
+            plot = pd.concat(frames, ignore_index=True)
+            fig = px.line(plot, x="Date", y="Value", color="Indicator", title="Indexed to 100" if rebase else "Historical levels", template="plotly_white")
+            fig.update_layout(hovermode="x unified", height=520)
+            st.plotly_chart(fig, use_container_width=True)
+            if not rebase and len(selected) > 1:
+                st.caption("Different indicators may have incompatible units. Use one series at a time, or rebase compatible positive-valued series to 100.")
 
-    current = s.iloc[-1]
-    old = previous.iloc[-1]
-
-    if unit == "bp":
-        return (current - old) * 100
-    if unit == "points":
-        return current - old
-    if old == 0:
-        return None
-    return (current / old - 1) * 100
-
-
-with tab1:
-    st.subheader("Latest Market Movements")
-
-    rows = []
-
-    for name, (_, unit) in SERIES.items():
-        if name not in data:
-            continue
-
-        s = data[name].dropna()
-        if s.empty:
-            continue
-
-        row = {
-            "Indicator": name,
-            "Latest": round(s.iloc[-1], 3),
-            "As of": s.index[-1].strftime("%Y-%m-%d"),
-            "Change unit": unit
-        }
-
-        for label, days in periods.items():
-            value = historical_change(s, days, unit)
-            row[label] = (
-                round(value, 2)
-                if value is not None else None
-            )
-
-        rows.append(row)
-
-    summary = pd.DataFrame(rows)
-    # Format the market movements table
-    display_df = summary.copy()
-    
-    # Format numeric columns
-    change_cols = ["1D", "1W", "1M", "3M", "1Y"]
-    
-    styled_df = (
-        display_df
-        .set_index("Indicator")
-        .style
-        .format({
-            "Latest": "{:.3f}",
-            **{col: "{:+.1f}" for col in change_cols}
-        }, na_rep="—")
-        .map(
-            lambda v: (
-                "color: #d9534f" if v > 0
-                else "color: #198754" if v < 0
-                else ""
-            ),
-            subset=change_cols
-        )
-    )
-    
-    st.table(styled_df)
-    
-
-    st.caption(
-        "Yield and credit spread changes are in bp; "
-        "VIX changes are in index points; "
-        "equity and FX changes are percentages. "
-        "Lookbacks use calendar days."
-    )
-
-    st.download_button(
-        "Download market movements",
-        summary.to_csv(index=False),
-        "market_movements.csv",
-        "text/csv"
-    )
-
-
-with tab2:
-    st.subheader("Historical Trends")
-
-    indicator = st.selectbox(
-        "Select indicator",
-        list(data.columns)
-    )
-
-    lookback = st.selectbox(
-        "Chart period",
-        ["3M", "1Y", "5Y", "10Y", "All"],
-        index=2
-    )
-
-    s = data[indicator].dropna()
-
-    if lookback != "All":
-        days = {
-            "3M": 90,
-            "1Y": 365,
-            "5Y": 365 * 5,
-            "10Y": 365 * 10
-        }[lookback]
-
-        s = s.loc[
-            s.index >= s.index[-1] - pd.Timedelta(days=days)
-        ]
-
-    chart_data = pd.DataFrame({
-        "Date": s.index,
-        "Value": s.to_numpy()
-    })
-
-    fig = px.line(
-        chart_data,
-        x="Date",
-        y="Value",
-        title=indicator,
-        template="plotly_white"
-    )
-    fig.update_layout(
-        hovermode="x unified",
-        height=500
-    )
-
-    st.plotly_chart(fig, width="stretch")
-
-
-with tab3:
-    st.subheader("Historical Stress Benchmarking")
-
-    indicator = st.selectbox(
-        "Indicator to benchmark",
-        list(data.columns),
-        key="stress_indicator"
-    )
-
-    horizon = st.selectbox(
-        "Movement horizon",
-        ["1M", "3M", "1Y"],
-        index=1
-    )
-
+with stress_tab:
+    st.subheader("Historical movement benchmarking")
+    indicator = st.selectbox("Indicator", names)
+    horizon = st.selectbox("Change horizon", ["1M", "3M", "1Y"], index=1)
     days = {"1M": 30, "3M": 90, "1Y": 365}[horizon]
-
-    s = data[indicator].dropna()
-    unit = SERIES[indicator][1]
-
-    # Use an as-of observation for calendar lookbacks.
-    past = pd.merge_asof(
-        pd.DataFrame({
-            "Date": s.index,
-            "Target": s.index - pd.Timedelta(days=days)
-        }).sort_values("Target"),
-        pd.DataFrame({
-            "PastDate": s.index,
-            "PastValue": s.to_numpy()
-        }),
-        left_on="Target",
-        right_on="PastDate",
-        direction="backward"
-    ).sort_values("Date")
-
-    current = pd.Series(s.to_numpy(), index=s.index)
-    previous = pd.Series(
-        past["PastValue"].to_numpy(),
-        index=pd.DatetimeIndex(past["Date"])
-    )
-
-    if unit == "bp":
-        changes = (current - previous) * 100
-    elif unit == "points":
-        changes = current - previous
+    changes = rolling_changes(series[indicator], days, meta[indicator]["kind"])
+    if len(changes) < 20:
+        st.warning("Insufficient observations for a meaningful distribution.")
     else:
-        changes = (current / previous - 1) * 100
+        latest = float(changes.iloc[-1])
+        percentile = float((changes <= latest).mean() * 100)
+        unit = "bp" if meta[indicator]["kind"] == "rate" else "%"
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"Latest {horizon} change", f"{latest:+.2f} {unit}")
+        c2.metric("Signed historical percentile", f"{percentile:.1f}%")
+        c3.metric("Historical observations", f"{len(changes):,}")
+        fig = px.histogram(x=changes.to_numpy(), nbins=60, labels={"x": f"{horizon} change ({unit})"}, title=f"{indicator}: historical {horizon} changes")
+        fig.add_vline(x=latest, line_dash="dash", line_color="red")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Percentiles describe the historical distribution of overlapping observations, not forward-looking probabilities. A high signed percentile is not always adverse. Series coverage differs by indicator.")
 
-    changes = changes.replace(
-        [float("inf"), float("-inf")], float("nan")
-    ).dropna()
-
-    if changes.empty:
-        st.warning("Insufficient history for benchmarking.")
-    else:
-        latest = changes.iloc[-1]
-        percentile = (changes <= latest).mean() * 100
-
-        c1, c2 = st.columns(2)
-        c1.metric(
-            f"Latest {horizon} change",
-            f"{latest:.2f} {unit}"
-        )
-        c2.metric(
-            "Historical percentile",
-            f"{percentile:.1f}%"
-        )
-
-        fig = px.histogram(
-            x=changes.to_numpy(),
-            nbins=60,
-            labels={"x": f"Change ({unit})"},
-            title=f"{indicator}: {horizon} changes"
-        )
-        fig.add_vline(
-            x=latest,
-            line_dash="dash",
-            line_color="red"
-        )
-
-        st.plotly_chart(fig, width="stretch")
-
-        st.caption(
-            "Percentiles are descriptive, based on "
-            "overlapping historical observations. "
-            "They are not probabilities of future stress."
-        )
+with data_tab:
+    st.subheader("Data availability and sources")
+    availability = pd.DataFrame([{"Indicator": n, "Economy": meta[n]["country"], "Source": meta[n]["source"], "First observation": s.index.min().date().isoformat(), "Latest observation": s.index.max().date().isoformat(), "Count": len(s)} for n, s in series.items() if not s.empty])
+    st.dataframe(availability, hide_index=True, use_container_width=True)
+    st.markdown("**FRED:** https://fred.stlouisfed.org/  \\n**MAS statistics:** https://www.mas.gov.sg/statistics  \\n**MAS SGS information:** https://www.mas.gov.sg/bonds-and-bills/singapore-government-securities")
+    st.caption("FRED FX series are expressed as stated in the indicator label (e.g. USD/SGD is SGD per USD). The dashboard does not assume that cross-country data are equally timely or directly comparable.")
+    all_data = pd.concat(series, axis=1).sort_index()
+    st.download_button("Download all loaded observations", all_data.to_csv(index_label="Date"), file_name="macrofinancial_observations.csv", mime="text/csv")
 
 st.divider()
-st.caption(
-    "Data are provided for monitoring and research. "
-    "Latest observations may be delayed or revised."
-)
+st.caption("Research prototype. Verify series definitions, units, availability, and any restrictions before using for official work. Do not upload confidential or proprietary data to a public cloud app.")
