@@ -1,4 +1,5 @@
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 
 import numpy as np
@@ -41,14 +42,25 @@ def fetch_fred(code):
     s = pd.Series(values.to_numpy(), index=pd.DatetimeIndex(dates), name=code)
     return s.loc[~s.index.isna()].dropna().sort_index()
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_all():
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_all(requested_names):
+    """Fetch selected FRED series in parallel; reuse per-series cached results."""
     series, failures = {}, {}
-    for name, (_, _, code, _) in CATALOG.items():
-        try:
-            series[name] = fetch_fred(code).rename(name)
-        except Exception as exc:
-            failures[name] = str(exc)
+    if not requested_names:
+        return series, failures
+
+    def download(name):
+        code = CATALOG[name][2]
+        return fetch_fred(code).rename(name)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(requested_names))) as executor:
+        futures = {executor.submit(download, name): name for name in requested_names}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                series[name] = future.result()
+            except Exception as exc:
+                failures[name] = str(exc)
     return series, failures
 
 # Upload a CSV exported from an official MAS source. The app does not assume
@@ -119,8 +131,12 @@ with st.sidebar:
     upload = st.file_uploader("Upload CSV", type="csv")
     sg_name = st.text_input("Series name", "SG 10Y SGS")
 
-with st.spinner("Loading public market data..."):
-    series, failures = fetch_all()
+requested_names = tuple(
+    name for name, (country, category, _, _) in CATALOG.items()
+    if country in selected_countries and category in selected_categories
+)
+with st.spinner(f"Loading {len(requested_names)} public market series..."):
+    series, failures = fetch_all(requested_names)
 meta = {name: {"country": country, "category": category, "kind": kind, "source": "FRED"} for name, (country, category, _, kind) in CATALOG.items() if name in series}
 
 if upload is not None:
@@ -166,6 +182,9 @@ for name in names:
         row[p] = asof_change(s, d, m["kind"])
     rows.append(row)
 summary = pd.DataFrame(rows)
+if summary.empty:
+    st.warning("No observations available for the selected filters. Check data retrieval warnings or change your selection.")
+    st.stop()
 
 market_tab, chart_tab, stress_tab, data_tab = st.tabs(["Market Overview", "Historical Charts", "Stress Benchmarking", "Data & Sources"])
 with market_tab:
