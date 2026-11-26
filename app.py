@@ -137,7 +137,32 @@ with tab1:
         rows.append(row)
 
     summary = pd.DataFrame(rows)
-    st.dataframe(summary, hide_index=True, width="stretch")
+    # Format the market movements table
+    display_df = summary.copy()
+    
+    # Format numeric columns
+    change_cols = ["1D", "1W", "1M", "3M", "1Y"]
+    
+    styled_df = (
+        display_df
+        .set_index("Indicator")
+        .style
+        .format({
+            "Latest": "{:.3f}",
+            **{col: "{:+.1f}" for col in change_cols}
+        }, na_rep="—")
+        .map(
+            lambda v: (
+                "color: #d9534f" if v > 0
+                else "color: #198754" if v < 0
+                else ""
+            ),
+            subset=change_cols
+        )
+    )
+    
+    st.table(styled_df)
+    
 
     st.caption(
         "Yield and credit spread changes are in bp; "
