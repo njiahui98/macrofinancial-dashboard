@@ -94,7 +94,39 @@ def rolling_changes(s, days, kind):
     if s.empty:
         return pd.Series(dtype=float)
     now = pd.DataFrame({"date": s.index, "current": s.to_numpy()})
-            cols = list(raw.columns)
+    past = pd.DataFrame({"past_date": s.index, "prior": s.to_numpy()})
+    now["target"] = now["date"] - pd.Timedelta(days=days)
+    joined = pd.merge_asof(now.sort_values("target"), past, left_on="target", right_on="past_date", direction="backward")
+    joined = joined.sort_values("date")
+    gap = (joined["target"] - joined["past_date"]).dt.days
+    joined.loc[gap > 10, "prior"] = np.nan
+    if kind == "rate":
+        values = (joined["current"] - joined["prior"]) * 100
+    else:
+        values = (joined["current"] / joined["prior"] - 1) * 100
+    return pd.Series(values.to_numpy(), index=pd.DatetimeIndex(joined["date"])).replace([np.inf, -np.inf], np.nan).dropna()
+
+st.title("Macrofinancial Risk Monitor")
+st.caption("Free public-data monitor · FRED market series · optional official Singapore data uploads")
+
+with st.sidebar:
+    st.header("Coverage")
+    selected_countries = st.multiselect("Economies", ["Singapore", "United States", "China", "Japan", "Euro area", "United Kingdom"], default=["Singapore", "United States"])
+    selected_categories = st.multiselect("Asset classes", ["Rates", "Credit", "FX", "Equities", "Volatility"], default=["Rates", "Credit", "FX", "Equities", "Volatility"])
+    st.divider()
+    st.subheader("Singapore SGS / SORA (optional)")
+    st.caption("Upload public official data as CSV. Format: a date column and one numeric value column; yield/rate levels should be in percent, e.g. 2.75, not 0.0275.")
+    upload = st.file_uploader("Upload CSV", type="csv")
+    sg_name = st.text_input("Series name", "SG 10Y SGS")
+
+with st.spinner("Loading public market data..."):
+    series, failures = fetch_all()
+meta = {name: {"country": country, "category": category, "kind": kind, "source": "FRED"} for name, (country, category, _, kind) in CATALOG.items() if name in series}
+
+if upload is not None:
+    try:
+        raw = read_sg_csv(upload)
+        cols = list(raw.columns)
         with st.sidebar:
             date_col = st.selectbox("Date column", cols, index=0)
             value_col = st.selectbox("Value column", cols, index=min(1, len(cols)-1))
